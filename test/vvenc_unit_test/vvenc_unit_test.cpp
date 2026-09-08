@@ -3774,17 +3774,6 @@ static bool check_needRdoq( Quant* ref, Quant* opt, unsigned num_cases )
     passed = run_one( coeff, 26214, shift, offset, "offset==2^shift all-zero" ) && passed;
   }
 
-  // Function-domain edge case: numCoeff not a multiple of four. Real call
-  // sites never pass one (efArea is always width * min(height,32), both
-  // powers of two), so this exercises the <4-remainder scalar tail
-  // (Quant_neon.cpp) that would otherwise never run under any case above.
-  for( unsigned numCoeff : { 3u, 7u, 13u } )
-  {
-    std::vector<TCoeff> coeff( numCoeff );
-    std::generate( coeff.begin(), coeff.end(), coeffGen );
-    passed = run_one( coeff, 13107, 21, 256LL << ( 21 - 9 ), "non-multiple-of-4 tail" ) && passed;
-  }
-
   return passed;
 }
 

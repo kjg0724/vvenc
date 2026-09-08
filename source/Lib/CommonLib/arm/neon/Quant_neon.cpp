@@ -80,8 +80,7 @@ static inline bool any_lane_set_u32x4( const uint32x4_t v )
 // quantization. Real call sites always pass a numCoeff that is a
 // multiple of four (efArea = width * min(height,32), both powers of
 // two), so the bulk of the buffer is handled 8 coefficients at a time
-// with a 4-wide remainder step; a smaller remainder falls through to a
-// plain scalar loop.
+// with a 4-wide remainder step.
 //
 // The scalar test is ( abs(iLevel)*quantCoeff + offset ) >> shift != 0.
 // That sum is non-negative in the real call domain (coeff clipped to
@@ -101,6 +100,8 @@ static inline bool any_lane_set_u32x4( const uint32x4_t v )
 // because it is slower for the numCoeff values real call sites pass.
 static bool needRdoqNeon( const TCoeff* pCoeff, size_t numCoeff, int quantCoeff, int64_t offset, int shift )
 {
+  CHECKD( numCoeff % 4 != 0, "numCoeff must be a multiple of four" );
+
   const int64_t  rem         = ( ( int64_t )1 << shift ) - offset;
   const int32_t  levelThresh = ( int32_t )( ( rem + quantCoeff - 1 ) / quantCoeff );
 
@@ -120,18 +121,10 @@ static bool needRdoqNeon( const TCoeff* pCoeff, size_t numCoeff, int quantCoeff,
     if( any_lane_set_u32x4( vorrq_u32( s0, s1 ) ) )
       return true;
   }
-  if( i + 4 <= numCoeff )
+  if( i < numCoeff )
   {
     const uint32x4_t s0 = survivors( vld1q_s32( pCoeff + i ) );
     if( any_lane_set_u32x4( s0 ) )
-      return true;
-    i += 4;
-  }
-  for( ; i < numCoeff; i++ )  // defensive: real call sites never leave a <4 remainder here
-  {
-    const TCoeff  iLevel   = pCoeff[i];
-    const int64_t tmpLevel = ( int64_t ) std::abs( iLevel ) * quantCoeff;
-    if( TCoeff( ( tmpLevel + offset ) >> shift ) != 0 )
       return true;
   }
   return false;
