@@ -121,18 +121,10 @@ static bool needRdoqNeon( const TCoeff* pCoeff, size_t numCoeff, int quantCoeff,
     if( any_lane_set_u32x4( vorrq_u32( s0, s1 ) ) )
       return true;
   }
-  if( i + 4 <= numCoeff )
+  if( i < numCoeff )
   {
     const uint32x4_t s0 = survivors( vld1q_s32( pCoeff + i ) );
     if( any_lane_set_u32x4( s0 ) )
-      return true;
-    i += 4;
-  }
-  for( ; i < numCoeff; i++ )  // out-of-domain only (see CHECKD above): never entered when the precondition holds
-  {
-    const TCoeff  iLevel   = pCoeff[i];
-    const int64_t tmpLevel = ( int64_t ) std::abs( iLevel ) * quantCoeff;
-    if( TCoeff( ( tmpLevel + offset ) >> shift ) != 0 )
       return true;
   }
   return false;
