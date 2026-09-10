@@ -145,15 +145,22 @@ static bool needRdoqNeon( const TCoeff* pCoeff, size_t numCoeff, int quantCoeff,
 // are int32, so a single widening multiply (vmull_n_s16) into 32-bit lanes
 // replaces DeQuantCore's Intermediate_Int arithmetic; no 64-bit lanes are
 // needed. Overflow check for the real (bitDepth, QP, shape) domain of this
-// codebase: |q*scale| <= 32767*102 < 2^22, and the most negative rightShift
-// this encoder's parameter formulas can produce is -9, so the largest left
-// shift is 9 and the shifted product stays under 2^31 - 1.
+// codebase: the most negative rightShift this encoder's parameter formulas
+// can produce is -10, reached by an SBT-quartered 2x2 chroma sub-block (a
+// vertical-half SBT on an 8-wide inter CU, in 4:2:0, halved once more by a
+// second SBT split) at QP_per's maximum (10 at 8-bit, 12 at 10-bit). At that
+// shift inputMaximum -- derived at the call site as
+// (1 << (min(16, 25+rightShift) - 1)) - 1 -- is itself only 16383, not
+// 32767, so |q*scale| <= 16383*102 < 2^21, and the largest left shift (10)
+// keeps the shifted product under 2^31 - 1. inputMaximum only reaches its
+// ordinary 32767 for rightShift >= -9, where the same left-shift bound holds
+// a fortiori.
 //
 // Real call sites (Quant::dequant's !enableScalingLists path) always pass
-// a width (maxX+1) that is 1 (degenerate ISP), 2 (e.g. 2x4/4x2 chroma), 4,
-// or a multiple of 8 (ordinary transform sizes up to 64) -- never 3, 5, 6,
-// or 7. Each width uses an exactly-sized tight load/store (no over-read or
-// over-write).
+// a width (maxX+1) that is 1 (degenerate ISP), 2 (e.g. 2x4/4x2/2x2 chroma),
+// 4, or a multiple of 8 (ordinary transform sizes up to 64) -- never 3, 5,
+// 6, or 7. Each width uses an exactly-sized tight load/store (no over-read
+// or over-write).
 static void dequantNeon( const int maxX, const int maxY, const int scale, const TCoeffSig* const piQCoef,
                           const size_t piQCfStride, TCoeff* const piCoef, const int rightShift,
                           const int inputMaximum, const TCoeff transformMaximum )

@@ -3841,25 +3841,52 @@ static bool check_needRdoq( Quant* ref, Quant* opt, unsigned num_cases )
 }
 
 // Quant::dequant's !enableScalingLists path (Quant.cpp) always passes
-// inputMaximum == transformMaximum == 32767: maxLog2TrDynamicRange is a
-// fixed 15 (Slice.h), so transformMaximum = (1<<15)-1 unconditionally, and
-// the input clip depth d = min(16, 25+rightShift) is always 16 (see
-// kMinRealRightShift below), so inputMaximum = (1<<16>>1)-1 = 32767 too.
-static constexpr int kRealInputMaximum     = 32767;
+// transformMaximum == 32767: maxLog2TrDynamicRange is a fixed 15 (Slice.h),
+// so transformMaximum = (1<<15)-1 unconditionally. inputMaximum, however,
+// is NOT always 32767 -- see realInputMaximumFor() below, which mirrors the
+// call site's own derivation and must be used instead of a flat constant
+// once rightShift can reach -10 (see kMinRealRightShift).
 static constexpr TCoeff kRealTransformMaximum = 32767;
 
 // rightShift = IQUANT_SHIFT(6) - ((isTransformSkip?0:iTransformShift) + QP_per).
 // iTransformShift = 15 - bitDepth - ((log2(w)+log2(h))>>1) - (sqrtAdj?1:0)
 // (Quant.h/Quant.cpp), with bitDepth in {8,10} and QP_per bounded by baseQp's
 // clip to [0, 63+6*(bitDepth-8)] (Quant.cpp). Over the reachable ordinary
-// (power-of-two, 4..64) and ISP-degenerate (1x16/1x32/1x64 and mirrored)
-// shapes this gives non-transform-skip range [-9,7] and transform-skip range
-// [-6,6], so [-9,7] overall. Overflow check for that range: |q*scale| <=
-// 32767*102 < 2^22, and left-shifting that by the largest reachable
-// magnitude (9, from rightShift=-9) stays under 2^31-1, so int32 lanes
-// never overflow.
-static constexpr int kMinRealRightShift = -9;
+// (power-of-two, 4..64), ISP-degenerate (1x16/1x32/1x64 and mirrored), and
+// 4:2:0 narrow-chroma (2xN/Nx2, including SBT-quartered 2x2 -- see below)
+// shapes this gives non-transform-skip range [-10,7] and transform-skip
+// range [-6,6], so [-10,7] overall.
+//
+// The -10 endpoint: CU::checkAllowedSbt (UnitTools.cpp) permits a vertical
+// SBT half-split at luma CU width 8, the minimum SBT-eligible size, and
+// getSbtTuTiling (UnitPartitioner.cpp) applies that same split factor to
+// every component's own area, not just luma's. An 8-wide, 8-tall inter CU
+// in 4:2:0 has 4x4 chroma; halving that by SBT gives a 2x4 (or 4x2) chroma
+// residual TU -- already in realShapes below -- and a second SBT split (or
+// an 8x4 CU to begin with) halves the surviving chroma dimension again to
+// 2x2. At (log2(2)+log2(2))>>1 = 1 and QP_per's maximum (10 at 8-bit, 12 at
+// 10-bit), rightShift = 6 - (15-bitDepth-1) - QP_per bottoms out at -10.
+//
+// inputMaximum tracks rightShift at that endpoint too: the call site's
+// input clip depth d = min(16, 25+rightShift) is 16 (inputMaximum=32767)
+// for rightShift in [-9,7], but drops to 15 (inputMaximum=16383) at
+// rightShift==-10 -- see realInputMaximumFor(). Overflow check for the full
+// range: at rightShift==-10, |q*scale| <= 16383*102 < 2^21, and the left
+// shift by 10 stays under 2^31-1. For rightShift in [-9,7] the same bound
+// holds a fortiori with inputMaximum=32767 (|q*scale| <= 32767*102 < 2^22,
+// shifted by at most 9). int32 lanes never overflow.
+static constexpr int kMinRealRightShift = -10;
 static constexpr int kMaxRealRightShift = 7;
+
+// Mirrors Quant::dequant's !enableScalingLists inputMaximum derivation
+// (Quant.cpp): targetInputBitDepth = min(maxLog2TrDynamicRange+1, 32+rightShift-scaleBits)
+// = min(16, 25+rightShift), since maxLog2TrDynamicRange is fixed at 15,
+// Intermediate_Int is 32-bit, and scaleBits = IQUANT_SHIFT(6)+1 = 7.
+static int realInputMaximumFor( int rightShift )
+{
+  const int targetInputBitDepth = std::min( 16, 25 + rightShift );
+  return ( 1 << ( targetInputBitDepth - 1 ) ) - 1;
+}
 
 static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
 {
@@ -3902,13 +3929,14 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
 
   // Random sweep across the real call-site domain: shapes reachable via
   // ordinary (power-of-two) transforms, ISP-degenerate 1xN/Nx1 blocks, and
-  // 4:2:0 chroma narrow 2xN/Nx2 blocks; scale from the real table;
+  // 4:2:0 chroma narrow 2xN/Nx2 blocks (including the SBT-quartered 2x2
+  // case -- see kMinRealRightShift above); scale from the real table;
   // rightShift from the domain derived above.
   static const std::pair<int, int> realShapes[] = {
     { 4, 4 },   { 4, 8 },   { 8, 4 },   { 8, 8 },   { 8, 16 },  { 16, 8 },  { 16, 16 }, { 16, 32 },
     { 32, 16 }, { 32, 32 }, { 32, 64 }, { 64, 32 }, { 64, 64 }, { 1, 16 },  { 1, 32 },  { 1, 64 },
     { 16, 1 },  { 32, 1 },  { 64, 1 },  { 2, 4 },   { 4, 2 },   { 2, 8 },   { 8, 2 },   { 2, 16 },
-    { 16, 2 },  { 2, 32 },  { 32, 2 },
+    { 16, 2 },  { 2, 32 },  { 32, 2 },  { 2, 2 },
   };
 
   for( unsigned n = 0; n < num_cases; n++ )
@@ -3921,8 +3949,8 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
     const size_t stride     = w;
 
     std::vector<TCoeffSig> coeff = makeTightBuffer( w - 1, h - 1, stride, 0, /*useGen=*/true );
-    passed = run_one( w - 1, h - 1, scale, coeff, stride, rightShift, kRealInputMaximum, kRealTransformMaximum,
-                      "random" ) &&
+    passed = run_one( w - 1, h - 1, scale, coeff, stride, rightShift, realInputMaximumFor( rightShift ),
+                      kRealTransformMaximum, "random" ) &&
              passed;
   }
 
@@ -3930,18 +3958,19 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
   const int directedShifts[] = { kMinRealRightShift, -1, 0, 1, kMaxRealRightShift };
   for( int width : { 1, 2, 4, 8, 16, 32, 64 } )
   {
-    for( int height : { 1, 4 } )
+    for( int height : { 1, 2, 4 } )
     {
       for( int scale : { 40, 64, 102 } ) // table extremes plus a power-of-two middle value
       {
         for( int rightShift : directedShifts )
         {
-          const size_t stride = width;
+          const size_t stride        = width;
+          const int    inputMaximum  = realInputMaximumFor( rightShift );
 
           // all-zero
           {
             std::vector<TCoeffSig> coeff = makeTightBuffer( width - 1, height - 1, stride, 0, false );
-            passed = run_one( width - 1, height - 1, scale, coeff, stride, rightShift, kRealInputMaximum,
+            passed = run_one( width - 1, height - 1, scale, coeff, stride, rightShift, inputMaximum,
                               kRealTransformMaximum, "all-zero" ) &&
                      passed;
           }
@@ -3949,7 +3978,7 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
           for( TCoeffSig extreme : { TCoeffSig( 32767 ), TCoeffSig( -32768 ) } )
           {
             std::vector<TCoeffSig> coeff = makeTightBuffer( width - 1, height - 1, stride, extreme, false );
-            passed = run_one( width - 1, height - 1, scale, coeff, stride, rightShift, kRealInputMaximum,
+            passed = run_one( width - 1, height - 1, scale, coeff, stride, rightShift, inputMaximum,
                               kRealTransformMaximum, "all-extreme " + std::to_string( extreme ) ) &&
                      passed;
           }
@@ -3958,7 +3987,7 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
             std::vector<TCoeffSig> coeff( (size_t)height * stride, TCoeffSig( 0 ) );
             for( size_t i = 0; i < coeff.size(); i++ )
               coeff[i] = ( i & 1 ) ? TCoeffSig( -32768 ) : TCoeffSig( 32767 );
-            passed = run_one( width - 1, height - 1, scale, coeff, stride, rightShift, kRealInputMaximum,
+            passed = run_one( width - 1, height - 1, scale, coeff, stride, rightShift, inputMaximum,
                               kRealTransformMaximum, "alternating-sign" ) &&
                      passed;
           }
@@ -3968,7 +3997,7 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
           {
             std::vector<TCoeffSig> coeff = makeTightBuffer( width - 1, height - 1, stride, 0, false );
             coeff[7] = TCoeffSig( -32768 );
-            passed = run_one( width - 1, height - 1, scale, coeff, stride, rightShift, kRealInputMaximum,
+            passed = run_one( width - 1, height - 1, scale, coeff, stride, rightShift, inputMaximum,
                               kRealTransformMaximum, "isolated pos=7" ) &&
                      passed;
           }
@@ -3977,11 +4006,34 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
     }
   }
 
+  // Directed real-domain boundary case: an 8-wide inter CU's SBT-quartered
+  // 2x2 chroma residual TU (see kMinRealRightShift above) at QP_per's
+  // maximum drives rightShift to -10, which is also the only real-domain
+  // value where inputMaximum drops below 32767 -- to 16383. This is the
+  // production combination the [-9,7]/32767-only assumption used to miss;
+  // exercise the kernel's input-clamp branch right at that real boundary,
+  // not just the synthetic inputMaximum==100 case above.
+  {
+    const int width = 2, height = 2, scale = 64, rightShift = kMinRealRightShift;
+    const int inputMaximum = realInputMaximumFor( rightShift );
+    CHECK( inputMaximum != 16383, "expected the real rightShift=-10 call site to clip at 16383" );
+    for( TCoeffSig q : { TCoeffSig( 16382 ), TCoeffSig( 16383 ), TCoeffSig( 16384 ), TCoeffSig( -16384 ),
+                        TCoeffSig( -16385 ), TCoeffSig( -16386 ), TCoeffSig( 32767 ), TCoeffSig( -32768 ) } )
+    {
+      std::vector<TCoeffSig> coeff = makeTightBuffer( width - 1, height - 1, width, q, false );
+      passed = run_one( width - 1, height - 1, scale, coeff, width, rightShift, inputMaximum, kRealTransformMaximum,
+                        "2x2 SBT chroma input-clip q=" + std::to_string( q ) ) &&
+               passed;
+    }
+  }
+
   // Function-domain edge case, not a real call-site value: an inputMaximum
-  // below the real 32767 (real call sites always pass 32767, since the input
-  // clip depth is always 16 in-domain -- see kMinRealRightShift above), so
-  // this is the only way to exercise the input-clamp branch of the kernel
-  // at all. Coefficients just below/at/above the clip boundary, both signs.
+  // this far below 32767 never occurs at a real call site (the smallest
+  // real inputMaximum is 16383, at rightShift==-10 -- see
+  // realInputMaximumFor() and the directed 2x2-chroma case above), but it's
+  // the cheapest way to exercise the kernel's input-clamp branch at a small,
+  // easy-to-reason-about boundary. Coefficients just below/at/above the
+  // clip boundary, both signs.
   {
     const int inputMaximum = 100;
     const int width = 4, height = 2, scale = 64, rightShift = 1;
@@ -4006,7 +4058,7 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
     const int    height = 4;
     const size_t stride = width + 3;
     std::vector<TCoeffSig> coeff = makeTightBuffer( width - 1, height - 1, stride, 0, /*useGen=*/true );
-    passed = run_one( width - 1, height - 1, 64, coeff, stride, 2, kRealInputMaximum, kRealTransformMaximum,
+    passed = run_one( width - 1, height - 1, 64, coeff, stride, 2, realInputMaximumFor( 2 ), kRealTransformMaximum,
                       "padded-stride" ) &&
              passed;
   }
