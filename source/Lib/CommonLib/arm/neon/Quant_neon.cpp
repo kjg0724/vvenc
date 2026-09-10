@@ -52,6 +52,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "CommonDefARM.h"
 #include "CommonLib/CommonDef.h"
 #include "CommonLib/Quant.h"
+#include "CommonLib/arm/mem_neon.h"
 
 //! \ingroup CommonLib
 //! \{
@@ -130,10 +131,90 @@ static bool needRdoqNeon( const TCoeff* pCoeff, size_t numCoeff, int quantCoeff,
   return false;
 }
 
+// Mirrors DeQuantCore (Quant.cpp). Per coefficient:
+//   q  = clip(piQCoef[x], -inputMaximum-1, inputMaximum)
+//   v  = rightShift > 0 ? (q*scale + (1 << (rightShift-1))) >> rightShift
+//                        :  q*scale << -rightShift
+//   piCoef[x] = clip(v, -transformMaximum-1, transformMaximum)
+//
+// vrshlq_s32 with a per-lane shift count of -rightShift reproduces both
+// branches exactly: for rightShift>0 (negative count) SRSHL adds the same
+// rounding half-unit before an arithmetic right shift; for rightShift<=0
+// (non-negative count) it's a plain left shift, matching the scalar's
+// un-rounded `<< -rightShift`. TCoeffSig is int16, TCoeff/Intermediate_Int
+// are int32, so a single widening multiply (vmull_n_s16) into 32-bit lanes
+// replaces DeQuantCore's Intermediate_Int arithmetic; no 64-bit lanes are
+// needed. Overflow check for the real (bitDepth, QP, shape) domain of this
+// codebase: |q*scale| <= 32767*102 < 2^22, and the most negative rightShift
+// this encoder's parameter formulas can produce is -9, so the largest left
+// shift is 9 and the shifted product stays under 2^31 - 1.
+//
+// Real call sites (Quant::dequant's !enableScalingLists path) always pass
+// a width (maxX+1) that is 1 (degenerate ISP), 2 (e.g. 2x4/4x2 chroma), 4,
+// or a multiple of 8 (ordinary transform sizes up to 64) -- never 3, 5, 6,
+// or 7. Each width uses an exactly-sized tight load/store (no over-read or
+// over-write).
+static void dequantNeon( const int maxX, const int maxY, const int scale, const TCoeffSig* const piQCoef,
+                          const size_t piQCfStride, TCoeff* const piCoef, const int rightShift,
+                          const int inputMaximum, const TCoeff transformMaximum )
+{
+  const int width = maxX + 1;
+  CHECKD( !( width == 1 || width == 2 || width == 4 || ( width >= 8 && ( width & 7 ) == 0 ) ),
+          "width must be 1, 2, 4, or a multiple of eight" );
+
+  const int16x4_t vInputMax = vdup_n_s16( ( int16_t )inputMaximum );
+  const int16x4_t vInputMin = vdup_n_s16( ( int16_t )( -inputMaximum - 1 ) );
+  const int32x4_t vShift    = vdupq_n_s32( -rightShift );
+  const int32x4_t vTMax     = vdupq_n_s32( transformMaximum );
+  const int32x4_t vTMin     = vdupq_n_s32( -transformMaximum - 1 );
+
+  auto convert = [&]( int16x4_t q ) -> int32x4_t {
+    q = vmax_s16( vmin_s16( q, vInputMax ), vInputMin );
+    int32x4_t v = vmull_n_s16( q, ( int16_t )scale );
+    v           = vrshlq_s32( v, vShift );
+    return vmaxq_s32( vminq_s32( v, vTMax ), vTMin );
+  };
+
+  if( width == 1 )
+  {
+    for( int y = 0; y <= maxY; y++ )
+    {
+      const int16x4_t q = vld1_lane_s16( piQCoef + y * piQCfStride, vdup_n_s16( 0 ), 0 );
+      vst1q_lane_s32( piCoef + y, convert( q ), 0 );
+    }
+    return;
+  }
+
+  for( int y = 0; y <= maxY; y++ )
+  {
+    const TCoeffSig* src = piQCoef + y * piQCfStride;
+    TCoeff*          dst = piCoef + y * width;
+
+    if( width == 2 )
+    {
+      vst1_s32( dst, vget_low_s32( convert( load_s16x2( src ) ) ) );
+    }
+    else if( width == 4 )
+    {
+      vst1q_s32( dst, convert( vld1_s16( src ) ) );
+    }
+    else
+    {
+      for( int x = 0; x < width; x += 8 )
+      {
+        const int16x8_t s = vld1q_s16( src + x );
+        vst1q_s32( dst + x, convert( vget_low_s16( s ) ) );
+        vst1q_s32( dst + x + 4, convert( vget_high_s16( s ) ) );
+      }
+    }
+  }
+}
+
 template<>
 void Quant::_initQuantARM<NEON>()
 {
   xNeedRdoq = needRdoqNeon;
+  xDeQuant  = dequantNeon;
 }
 
 }  // namespace vvenc
