@@ -3853,28 +3853,34 @@ static constexpr TCoeff kRealTransformMaximum = 32767;
 // (Quant.h/Quant.cpp), with bitDepth in {8,10} and QP_per bounded by baseQp's
 // clip to [0, 63+6*(bitDepth-8)] (Quant.cpp). Over the reachable ordinary
 // (power-of-two, 4..64), ISP-degenerate (1x16/1x32/1x64 and mirrored), and
-// 4:2:0 narrow-chroma (2xN/Nx2, including SBT-quartered 2x2 -- see below)
+// 4:2:0 narrow-chroma (2xN/Nx2, including SBT-halved 2x2 -- see below)
 // shapes this gives non-transform-skip range [-10,7] and transform-skip
 // range [-6,6], so [-10,7] overall.
 //
 // The -10 endpoint: CU::checkAllowedSbt (UnitTools.cpp) permits a vertical
 // SBT half-split at luma CU width 8, the minimum SBT-eligible size, and
 // getSbtTuTiling (UnitPartitioner.cpp) applies that same split factor to
-// every component's own area, not just luma's. An 8-wide, 8-tall inter CU
-// in 4:2:0 has 4x4 chroma; halving that by SBT gives a 2x4 (or 4x2) chroma
-// residual TU -- already in realShapes below -- and a second SBT split (or
-// an 8x4 CU to begin with) halves the surviving chroma dimension again to
-// 2x2. At (log2(2)+log2(2))>>1 = 1 and QP_per's maximum (10 at 8-bit, 12 at
-// 10-bit), rightShift = 6 - (15-bitDepth-1) - QP_per bottoms out at -10.
+// every component's own area, not just luma's. An 8x4 (or 4x8) inter CU in
+// 4:2:0 has 4x2 (or 2x4) chroma -- already in realShapes below -- and a
+// single vertical- (or horizontal-) half SBT split halves that once more to
+// 2x2 (a 16x4 CU with a vertical-quarter SBT split reaches the same 2x2
+// chroma shape too). SBT cannot recurse into a second split of an
+// already-SBT-split TU (Partitioner::canSplit only allows an SBT split at
+// currTrDepth==0), so one SBT split on an already-narrow chroma dimension
+// is the only way to reach 2x2. At (log2(2)+log2(2))>>1 = 1 and QP_per's
+// maximum (10 at 8-bit, 12 at 10-bit), rightShift = 6 - (15-bitDepth-1) -
+// QP_per bottoms out at -10.
 //
 // inputMaximum tracks rightShift at that endpoint too: the call site's
 // input clip depth d = min(16, 25+rightShift) is 16 (inputMaximum=32767)
 // for rightShift in [-9,7], but drops to 15 (inputMaximum=16383) at
 // rightShift==-10 -- see realInputMaximumFor(). Overflow check for the full
-// range: at rightShift==-10, |q*scale| <= 16383*102 < 2^21, and the left
-// shift by 10 stays under 2^31-1. For rightShift in [-9,7] the same bound
-// holds a fortiori with inputMaximum=32767 (|q*scale| <= 32767*102 < 2^22,
-// shifted by at most 9). int32 lanes never overflow.
+// range: clip(q, -inputMaximum-1, inputMaximum) admits the asymmetric
+// minimum -inputMaximum-1, so at rightShift==-10, |q*scale| <=
+// 16384*102 < 2^21, and the left shift by 10 stays under 2^31-1. For
+// rightShift in [-9,7] the same argument holds a fortiori with
+// inputMaximum=32767 (|q*scale| <= 32768*102 < 2^22, shifted by at most 9).
+// int32 lanes never overflow.
 static constexpr int kMinRealRightShift = -10;
 static constexpr int kMaxRealRightShift = 7;
 
@@ -3929,7 +3935,7 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
 
   // Random sweep across the real call-site domain: shapes reachable via
   // ordinary (power-of-two) transforms, ISP-degenerate 1xN/Nx1 blocks, and
-  // 4:2:0 chroma narrow 2xN/Nx2 blocks (including the SBT-quartered 2x2
+  // 4:2:0 chroma narrow 2xN/Nx2 blocks (including the SBT-halved 2x2
   // case -- see kMinRealRightShift above); scale from the real table;
   // rightShift from the domain derived above.
   static const std::pair<int, int> realShapes[] = {
@@ -3955,7 +3961,9 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
   }
 
   // Directed cases, still inside the real domain, asserted.
-  const int directedShifts[] = { kMinRealRightShift, -1, 0, 1, kMaxRealRightShift };
+  // kMinRealRightShift+1 (-9) is the boundary where inputMaximum switches
+  // back from 16383 to the ordinary 32767 -- worth its own directed point.
+  const int directedShifts[] = { kMinRealRightShift, kMinRealRightShift + 1, -1, 0, 1, kMaxRealRightShift };
   for( int width : { 1, 2, 4, 8, 16, 32, 64 } )
   {
     for( int height : { 1, 2, 4 } )
@@ -4006,23 +4014,55 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
     }
   }
 
-  // Directed real-domain boundary case: an 8-wide inter CU's SBT-quartered
-  // 2x2 chroma residual TU (see kMinRealRightShift above) at QP_per's
-  // maximum drives rightShift to -10, which is also the only real-domain
-  // value where inputMaximum drops below 32767 -- to 16383. This is the
-  // production combination the [-9,7]/32767-only assumption used to miss;
-  // exercise the kernel's input-clamp branch right at that real boundary,
-  // not just the synthetic inputMaximum==100 case above.
+  // Directed real-domain boundary case: an 8x4 (or 4x8) inter CU's
+  // single-half-SBT-split 2x2 chroma residual TU (see kMinRealRightShift
+  // above) at QP_per's maximum drives rightShift to -10, which is also the
+  // only real-domain value where inputMaximum drops below 32767 -- to
+  // 16383. This is the production combination the [-9,7]/32767-only
+  // assumption used to miss; exercise the kernel's input-clamp branch right
+  // at that real boundary, not just the synthetic inputMaximum==100 case
+  // above. scale is capped at 57 here, not the table's overall max of 102:
+  // QP_per's maximum only happens at baseQp's own clipped maximum (63 at
+  // 8-bit, 75 at 10-bit), which limits QP_rem -- and so g_invQuantScales's
+  // column index -- to 0..3, and a square 2x2 shape takes the
+  // no-sqrt-adjustment row ({40,45,51,57}), whose largest entry is 57.
   {
-    const int width = 2, height = 2, scale = 64, rightShift = kMinRealRightShift;
+    const int width = 2, height = 2, scale = 57, rightShift = kMinRealRightShift;
     const int inputMaximum = realInputMaximumFor( rightShift );
     CHECK( inputMaximum != 16383, "expected the real rightShift=-10 call site to clip at 16383" );
-    for( TCoeffSig q : { TCoeffSig( 16382 ), TCoeffSig( 16383 ), TCoeffSig( 16384 ), TCoeffSig( -16384 ),
-                        TCoeffSig( -16385 ), TCoeffSig( -16386 ), TCoeffSig( 32767 ), TCoeffSig( -32768 ) } )
+    for( TCoeffSig q : { TCoeffSig( 0 ), TCoeffSig( 1 ), TCoeffSig( -1 ), TCoeffSig( 16382 ), TCoeffSig( 16383 ),
+                        TCoeffSig( 16384 ), TCoeffSig( -16384 ), TCoeffSig( -16385 ), TCoeffSig( -16386 ),
+                        TCoeffSig( 32767 ), TCoeffSig( -32768 ) } )
     {
       std::vector<TCoeffSig> coeff = makeTightBuffer( width - 1, height - 1, width, q, false );
       passed = run_one( width - 1, height - 1, scale, coeff, width, rightShift, inputMaximum, kRealTransformMaximum,
                         "2x2 SBT chroma input-clip q=" + std::to_string( q ) ) &&
+               passed;
+    }
+  }
+
+  // Deterministic rounding tie, checked against a hand-computed expected
+  // value rather than just scalar-vs-optimized equivalence (which run_one
+  // alone gives): rightShift>0's rounding add-then-shift can round a tie
+  // either up or down depending on the implementation, so pin one down.
+  // scale=45, rightShift=1: v = (q*scale + (1<<(rightShift-1))) >> rightShift.
+  // q=1: (45+1)>>1 = 23. q=-1: (-45+1)>>1 = -44>>1 = -22 (exact, no
+  // further rounding ambiguity since -44 is even).
+  {
+    const int width = 1, height = 1, scale = 45, rightShift = 1;
+    const int inputMaximum = realInputMaximumFor( rightShift );
+    for( const auto& kv : std::vector<std::pair<TCoeffSig, TCoeff>>{ { 1, 23 }, { -1, -22 } } )
+    {
+      const TCoeffSig q        = kv.first;
+      const TCoeff    expected = kv.second;
+      std::vector<TCoeffSig> coeff = makeTightBuffer( width - 1, height - 1, width, q, false );
+      TCoeff outRef = 0;
+      ref->xDeQuant( width - 1, height - 1, scale, coeff.data(), width, &outRef, rightShift, inputMaximum,
+                     kRealTransformMaximum );
+      CHECK( outRef != expected, "rounding-tie q=" + std::to_string( q ) + " expected " +
+                                      std::to_string( expected ) + " got " + std::to_string( outRef ) );
+      passed = run_one( width - 1, height - 1, scale, coeff, width, rightShift, inputMaximum, kRealTransformMaximum,
+                        "rounding-tie q=" + std::to_string( q ) ) &&
                passed;
     }
   }

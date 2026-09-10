@@ -146,15 +146,18 @@ static bool needRdoqNeon( const TCoeff* pCoeff, size_t numCoeff, int quantCoeff,
 // replaces DeQuantCore's Intermediate_Int arithmetic; no 64-bit lanes are
 // needed. Overflow check for the real (bitDepth, QP, shape) domain of this
 // codebase: the most negative rightShift this encoder's parameter formulas
-// can produce is -10, reached by an SBT-quartered 2x2 chroma sub-block (a
-// vertical-half SBT on an 8-wide inter CU, in 4:2:0, halved once more by a
-// second SBT split) at QP_per's maximum (10 at 8-bit, 12 at 10-bit). At that
-// shift inputMaximum -- derived at the call site as
+// can produce is -10, reached by an SBT-halved 2x2 chroma sub-block (e.g.
+// an 8x4 -- or 4x8 -- inter CU in 4:2:0 has 4x2 -- or 2x4 -- chroma, and a
+// single vertical- or horizontal-half SBT split halves that once more to
+// 2x2; SBT cannot recurse into a second split of an already-SBT-split TU,
+// so this is the only way to reach it) at QP_per's maximum (10 at 8-bit, 12
+// at 10-bit). At that shift inputMaximum -- derived at the call site as
 // (1 << (min(16, 25+rightShift) - 1)) - 1 -- is itself only 16383, not
-// 32767, so |q*scale| <= 16383*102 < 2^21, and the largest left shift (10)
-// keeps the shifted product under 2^31 - 1. inputMaximum only reaches its
-// ordinary 32767 for rightShift >= -9, where the same left-shift bound holds
-// a fortiori.
+// 32767, and clip(q, -inputMaximum-1, inputMaximum) admits the asymmetric
+// minimum -16384, so |q*scale| <= 16384*102 < 2^21, and the largest left
+// shift (10) keeps the shifted product under 2^31 - 1. inputMaximum only
+// reaches its ordinary 32767 for rightShift >= -9, where the same argument
+// (|q| <= 32768) holds a fortiori.
 //
 // Real call sites (Quant::dequant's !enableScalingLists path) always pass
 // a width (maxX+1) that is 1 (degenerate ISP), 2 (e.g. 2x4/4x2/2x2 chroma),
