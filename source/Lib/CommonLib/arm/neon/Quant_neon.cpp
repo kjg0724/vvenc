@@ -164,6 +164,16 @@ static bool needRdoqNeon( const TCoeff* pCoeff, size_t numCoeff, int quantCoeff,
 // 4, or a multiple of 8 (ordinary transform sizes up to 64) -- never 3, 5,
 // 6, or 7. Each width uses an exactly-sized tight load/store (no over-read
 // or over-write).
+//
+// Each width gets its own top-level, non-overlapping loop (rather than a
+// width check re-evaluated on every row inside one shared loop), and input
+// clipping is applied once per load at whatever vector width that load
+// already has the data in -- 4 lanes for width 1/2/4, 8 lanes for width>=8
+// -- instead of being repeated separately on the low and high halves of an
+// 8-lane load. width==1 additionally batches four rows (when available)
+// into a single 4-lane vector, since piCoef's row stride is exactly one
+// TCoeff there, so four scalar rows can share one multiply/shift/store
+// instead of doing all three per row.
 static void dequantNeon( const int maxX, const int maxY, const int scale, const TCoeffSig* const piQCoef,
                           const size_t piQCfStride, TCoeff* const piCoef, const int rightShift,
                           const int inputMaximum, const TCoeff transformMaximum )
@@ -172,14 +182,17 @@ static void dequantNeon( const int maxX, const int maxY, const int scale, const 
   CHECKD( !( width == 1 || width == 2 || width == 4 || ( width >= 8 && ( width & 7 ) == 0 ) ),
           "width must be 1, 2, 4, or a multiple of eight" );
 
-  const int16x4_t vInputMax = vdup_n_s16( ( int16_t )inputMaximum );
-  const int16x4_t vInputMin = vdup_n_s16( ( int16_t )( -inputMaximum - 1 ) );
-  const int32x4_t vShift    = vdupq_n_s32( -rightShift );
-  const int32x4_t vTMax     = vdupq_n_s32( transformMaximum );
-  const int32x4_t vTMin     = vdupq_n_s32( -transformMaximum - 1 );
+  const int16x4_t vInputMax  = vdup_n_s16( ( int16_t )inputMaximum );
+  const int16x4_t vInputMin  = vdup_n_s16( ( int16_t )( -inputMaximum - 1 ) );
+  const int16x8_t vInputMaxQ = vdupq_n_s16( ( int16_t )inputMaximum );
+  const int16x8_t vInputMinQ = vdupq_n_s16( ( int16_t )( -inputMaximum - 1 ) );
+  const int32x4_t vShift     = vdupq_n_s32( -rightShift );
+  const int32x4_t vTMax      = vdupq_n_s32( transformMaximum );
+  const int32x4_t vTMin      = vdupq_n_s32( -transformMaximum - 1 );
 
-  auto convert = [&]( int16x4_t q ) -> int32x4_t {
-    q = vmax_s16( vmin_s16( q, vInputMax ), vInputMin );
+  // Multiply/round-shift/output-clip only; callers input-clip q themselves,
+  // once, before calling this.
+  auto scaleShiftClip = [&]( int16x4_t q ) -> int32x4_t {
     int32x4_t v = vmull_n_s16( q, ( int16_t )scale );
     v           = vrshlq_s32( v, vShift );
     return vmaxq_s32( vminq_s32( v, vTMax ), vTMin );
@@ -187,10 +200,42 @@ static void dequantNeon( const int maxX, const int maxY, const int scale, const 
 
   if( width == 1 )
   {
+    int y = 0;
+    for( ; y + 4 <= maxY + 1; y += 4 )
+    {
+      int16x4_t q = vdup_n_s16( 0 );
+      q = vld1_lane_s16( piQCoef + ( size_t )( y + 0 ) * piQCfStride, q, 0 );
+      q = vld1_lane_s16( piQCoef + ( size_t )( y + 1 ) * piQCfStride, q, 1 );
+      q = vld1_lane_s16( piQCoef + ( size_t )( y + 2 ) * piQCfStride, q, 2 );
+      q = vld1_lane_s16( piQCoef + ( size_t )( y + 3 ) * piQCfStride, q, 3 );
+      q = vmax_s16( vmin_s16( q, vInputMax ), vInputMin );
+      vst1q_s32( piCoef + y, scaleShiftClip( q ) );
+    }
+    for( ; y <= maxY; y++ )
+    {
+      int16x4_t q = vld1_lane_s16( piQCoef + ( size_t )y * piQCfStride, vdup_n_s16( 0 ), 0 );
+      q           = vmax_s16( vmin_s16( q, vInputMax ), vInputMin );
+      vst1q_lane_s32( piCoef + y, scaleShiftClip( q ), 0 );
+    }
+    return;
+  }
+
+  if( width == 2 )
+  {
     for( int y = 0; y <= maxY; y++ )
     {
-      const int16x4_t q = vld1_lane_s16( piQCoef + y * piQCfStride, vdup_n_s16( 0 ), 0 );
-      vst1q_lane_s32( piCoef + y, convert( q ), 0 );
+      int16x4_t q = vmax_s16( vmin_s16( load_s16x2( piQCoef + y * piQCfStride ), vInputMax ), vInputMin );
+      vst1_s32( piCoef + y * width, vget_low_s32( scaleShiftClip( q ) ) );
+    }
+    return;
+  }
+
+  if( width == 4 )
+  {
+    for( int y = 0; y <= maxY; y++ )
+    {
+      int16x4_t q = vmax_s16( vmin_s16( vld1_s16( piQCoef + y * piQCfStride ), vInputMax ), vInputMin );
+      vst1q_s32( piCoef + y * width, scaleShiftClip( q ) );
     }
     return;
   }
@@ -200,22 +245,12 @@ static void dequantNeon( const int maxX, const int maxY, const int scale, const 
     const TCoeffSig* src = piQCoef + y * piQCfStride;
     TCoeff*          dst = piCoef + y * width;
 
-    if( width == 2 )
+    for( int x = 0; x < width; x += 8 )
     {
-      vst1_s32( dst, vget_low_s32( convert( load_s16x2( src ) ) ) );
-    }
-    else if( width == 4 )
-    {
-      vst1q_s32( dst, convert( vld1_s16( src ) ) );
-    }
-    else
-    {
-      for( int x = 0; x < width; x += 8 )
-      {
-        const int16x8_t s = vld1q_s16( src + x );
-        vst1q_s32( dst + x, convert( vget_low_s16( s ) ) );
-        vst1q_s32( dst + x + 4, convert( vget_high_s16( s ) ) );
-      }
+      int16x8_t s = vld1q_s16( src + x );
+      s           = vmaxq_s16( vminq_s16( s, vInputMaxQ ), vInputMinQ );
+      vst1q_s32( dst + x, scaleShiftClip( vget_low_s16( s ) ) );
+      vst1q_s32( dst + x + 4, scaleShiftClip( vget_high_s16( s ) ) );
     }
   }
 }
