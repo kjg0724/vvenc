@@ -134,17 +134,18 @@ static bool needRdoqNeon( const TCoeff* pCoeff, size_t numCoeff, int quantCoeff,
 // Mirrors DeQuantCore (Quant.cpp). Per coefficient:
 //   q  = clip(piQCoef[x], -inputMaximum-1, inputMaximum)
 //   v  = rightShift > 0 ? (q*scale + (1 << (rightShift-1))) >> rightShift
-//                        :  q*scale << -rightShift
+//                        :  q*scale * (1 << -rightShift)
 //   piCoef[x] = clip(v, -transformMaximum-1, transformMaximum)
 //
 // vrshlq_s32 with a per-lane shift count of -rightShift reproduces both
 // branches exactly: for rightShift>0 (negative count) SRSHL adds the same
 // rounding half-unit before an arithmetic right shift; for rightShift<=0
-// (non-negative count) it's a plain left shift, matching the scalar's
-// un-rounded `<< -rightShift`. TCoeffSig is int16, TCoeff/Intermediate_Int
-// are int32, so a single widening multiply (vmull_n_s16) into 32-bit lanes
-// replaces DeQuantCore's Intermediate_Int arithmetic; no 64-bit lanes are
-// needed. Overflow check for the real (bitDepth, QP, shape) domain of this
+// (non-negative count) it's a plain left shift, numerically the same as
+// the scalar's unrounded multiplication by `1 << -rightShift`. TCoeffSig is
+// int16, TCoeff/Intermediate_Int are int32, so a single widening multiply
+// (vmull_n_s16) into 32-bit lanes replaces DeQuantCore's Intermediate_Int
+// arithmetic; no 64-bit lanes are needed. Overflow check for the real
+// (bitDepth, QP, shape) domain of this
 // codebase: the most negative rightShift this encoder's parameter formulas
 // can produce is -10, reached by an SBT-halved 2x2 chroma sub-block (e.g.
 // an 8x4 -- or 4x8 -- inter CU in 4:2:0 has 4x2 -- or 2x4 -- chroma, and a

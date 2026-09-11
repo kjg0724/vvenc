@@ -4103,6 +4103,28 @@ static bool check_dequant( Quant* ref, Quant* opt, unsigned num_cases )
              passed;
   }
 
+  // width==1's batch-of-4-rows loop (see dequantNeon) falls through to a
+  // scalar-style per-row tail for a non-multiple-of-4 remainder. Directed
+  // heights crossing that boundary: 3 (tail only, no full batch), 5/6/7
+  // (one full batch plus a 1/2/3-row tail), both with a tight and a padded
+  // (piQCfStride != width) input stride, to catch a lane-to-row mixup that
+  // a uniform or saturating buffer (as used elsewhere above) could hide.
+  // Coefficients are small, distinct per row, and alternate sign so a
+  // batch that silently permuted or dropped a row would show up as a
+  // mismatch instead of coincidentally matching via clipping.
+  for( int height : { 3, 5, 6, 7 } )
+  {
+    for( size_t stride : { ( size_t )1, ( size_t )1 + 3 } )
+    {
+      std::vector<TCoeffSig> coeff( ( size_t )height * stride, TCoeffSig( 0 ) );
+      for( int y = 0; y < height; y++ )
+        coeff[( size_t )y * stride] = TCoeffSig( ( y % 2 == 0 ) ? ( 10 + y ) : -( 10 + y ) );
+      passed = run_one( 0, height - 1, 64, coeff, stride, 1, realInputMaximumFor( 1 ), kRealTransformMaximum,
+                        "width=1 batch-tail boundary, stride=" + std::to_string( stride ) ) &&
+               passed;
+    }
+  }
+
   return passed;
 }
 
